@@ -78,27 +78,16 @@ The crawler operates in two phases:
 
 ## Performance Analytics
 
-| Metric                    | Value           |
-| ------------------------- | --------------- |
-| **System Resources**      |                 |
-| RAM Available             | 5.8 GB          |
-| CPUs                      | 10              |
-| Static Workers            | 37              |
-| Playwright Workers        | 8               |
-| **Crawl Statistics**      |                 |
-| Total Domains Crawled     | 50              |
-| Found (Static)            | 30 (60%)        |
-| Found (Playwright)        | 17 (34%)        |
-| **Total Success Rate**    | **94%** (47/50) |
-| Failed                    | 3 (6%)          |
-| **Timing**                |                 |
-| Static Phase Duration     | 43.1s           |
-| Playwright Phase Duration | 31.0s           |
-| **Total Time**            | ~74s            |
-| Static Rate               | 1.16 domains/s  |
-| Playwright Rate           | 0.65 domains/s  |
+| Metric             | Value   |
+| ------------------ | ------- |
+| Total Domains      | 50      |
+| Found (Static)     | 60%     |
+| Found (Playwright) | 34%     |
+| **Success Rate**   | **94%** |
+| Failed             | 6%      |
+| Total Time         | ~74s    |
 
-> **Note:** Performance may vary based on network conditions, target website response times, and system resources.
+> **Note:** Performance may vary based on network conditions and system resources.
 
 ---
 
