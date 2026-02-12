@@ -17,13 +17,6 @@ class PagePool:
     """
     A pool of reusable browser pages for concurrent scraping.
     
-    Usage:
-        async with PagePool(context, size=4) as pool:
-            page = await pool.acquire()
-            try:
-                # ... use page ...
-            finally:
-                await pool.release(page)
     """
     
     def __init__(self, context: BrowserContext, size: int = 4):
