@@ -1,21 +1,21 @@
-"""Domain processor with retry stages.
+"""Domain processor with single-pass extraction.
 
-Processes a single domain through multiple retry stages:
-- R1: 5 second timeout
-- R2: 7 second timeout (if R1 fails)
-- R3: 9 second timeout (if R2 fails)
-
-Also handles URL variants (https://, https://www., http://, http://www.)
+Processes a single domain with:
+- Single navigation attempt per URL variant
+- domcontentloaded wait + small delay (no networkidle)
+- Captcha detection and skip
+- Hard timeout enforced at browser_manager level
 """
 
 import sys
 from typing import Tuple, Optional
 from playwright.async_api import Page, TimeoutError as PlaywrightTimeout
 
-from ...config import PHASE_1_TIMEOUT, PHASE_R1_TIMEOUT, PHASE_R3_TIMEOUT
+from ...config import NAV_TIMEOUT, POST_NAV_DELAY
 from ...utils.validators import sanitize_domain
 from .logo_extractor import extract_logo, extract_favicon
 from .cookie_handler import handle_cookies, dismiss_overlays
+from .anti_blocking import detect_captcha
 
 
 # URL variants to try in order
@@ -29,7 +29,11 @@ URL_VARIANTS = [
 
 async def process_domain(page: Page, domain: str) -> Tuple[str, str]:
     """
-    Process a single domain with retry stages.
+    Process a single domain with single-pass extraction.
+    
+    Tries URL variants (https, https://www, http, http://www) sequentially.
+    Each attempt uses domcontentloaded + small delay.
+    Hard per-domain timeout is enforced at the browser_manager level.
     
     Args:
         page: Playwright page instance
@@ -47,7 +51,7 @@ async def process_domain(page: Page, domain: str) -> Tuple[str, str]:
     for url_template in URL_VARIANTS:
         url = url_template.format(clean_domain)
         
-        logo = await _process_url_with_retries(page, url)
+        logo = await _process_url(page, url)
         if logo:
             return (domain, logo)
     
@@ -55,9 +59,12 @@ async def process_domain(page: Page, domain: str) -> Tuple[str, str]:
     return (domain, "")
 
 
-async def _process_url_with_retries(page: Page, url: str) -> str:
+async def _process_url(page: Page, url: str) -> str:
     """
-    Process a URL through retry stages R1 -> R2 -> R3.
+    Process a single URL with single navigation attempt.
+    
+    Uses domcontentloaded + POST_NAV_DELAY instead of networkidle.
+    Includes captcha detection to skip blocked pages early.
     
     Args:
         page: Playwright page instance
@@ -67,18 +74,32 @@ async def _process_url_with_retries(page: Page, url: str) -> str:
         Logo URL if found, empty string otherwise.
     """
     try:
-        # Initial navigation with R1 timeout
+        # Navigate with domcontentloaded (faster than networkidle)
         await page.goto(
             url,
-            timeout=PHASE_1_TIMEOUT,
+            timeout=NAV_TIMEOUT,
             wait_until="domcontentloaded"
         )
     except PlaywrightTimeout:
         # Navigation timeout - try next URL variant
         return ""
-    except Exception as e:
+    except Exception:
         # Network error or other issue
         return ""
+    
+    # Small delay to let JS render (replaces networkidle)
+    try:
+        await page.wait_for_timeout(POST_NAV_DELAY)
+    except Exception:
+        pass
+    
+    # Check for captcha/challenge page
+    try:
+        if await detect_captcha(page):
+            sys.stderr.write(f"[PW] Captcha detected: {url}\n")
+            return ""
+    except Exception:
+        pass
     
     # Handle cookies/popups (non-blocking)
     try:
@@ -87,33 +108,7 @@ async def _process_url_with_retries(page: Page, url: str) -> str:
     except Exception:
         pass
     
-    # R1: First extraction attempt (page just loaded)
-    logo = await extract_logo(page)
-    if logo:
-        return logo
-    
-    # R2: Wait additional time and retry
-    try:
-        # Wait for more content to load
-        await page.wait_for_load_state("load", timeout=PHASE_R1_TIMEOUT - PHASE_1_TIMEOUT)
-    except PlaywrightTimeout:
-        pass
-    except Exception:
-        pass
-    
-    logo = await extract_logo(page)
-    if logo:
-        return logo
-    
-    # R3: Final wait and retry
-    try:
-        # Wait for network to be idle
-        await page.wait_for_load_state("networkidle", timeout=PHASE_R3_TIMEOUT - PHASE_R1_TIMEOUT)
-    except PlaywrightTimeout:
-        pass
-    except Exception:
-        pass
-    
+    # Extract logo
     logo = await extract_logo(page)
     if logo:
         return logo

@@ -2,6 +2,8 @@
 
 A high-performance, two-phase logo extraction tool that crawls websites to extract their logo URLs. The system uses a hybrid approach: fast static HTTP scraping first, then Playwright browser rendering for JavaScript-heavy sites.
 
+Includes anti-blocking measures: rate limiting, user-agent rotation, viewport rotation, and captcha detection.
+
 > **Note:** AI tools were used for research and troubleshooting during development. The core architecture and implementation are my own work.
 
 ---
@@ -31,7 +33,7 @@ nix-shell
 ## Usage
 
 ```bash
-cat websites.csv | python -m py.logocrawler.logo_crawler > results.csv
+cat websites.csv | python -m py.logocrawler.app > results.csv
 ```
 
 ### Input Format
@@ -58,7 +60,7 @@ Failed domains are logged to `failed_domains.csv`.
 
 ## Architecture
 
-The crawler operates in two phases:
+The crawler operates in two phases with anti-blocking protection:
 
 ### Phase 1: Static HTTP Scraping
 
@@ -73,6 +75,15 @@ The crawler operates in two phases:
 - Handles cookie consent dialogs automatically
 - Uses page pooling for efficiency (4 tabs per browser)
 - Processes remaining domains at ~0.65 requests/second
+
+### Anti-Blocking Features
+
+- **Rate limiting**: Random delays (500-1500ms) between requests
+- **User-agent rotation**: 7 browser UA strings (Chrome, Firefox, Safari)
+- **Viewport rotation**: 5 common screen resolutions
+- **Captcha detection**: Detects reCAPTCHA, hCaptcha, Cloudflare challenges
+- **Page lifecycle**: Pages recycled after 25 uses to prevent fingerprinting
+- **Hard timeout**: 12s per-domain limit prevents stuck tabs
 
 ---
 
@@ -95,7 +106,7 @@ The crawler operates in two phases:
 
 ```
 py/logocrawler/
-├── logo_crawler.py       # Main entry point
+├── app.py                # Main entry point
 ├── config.py             # Configuration constants
 ├── static/               # Static HTTP scraping
 │   ├── http_client.py
@@ -104,12 +115,14 @@ py/logocrawler/
 ├── playwright/           # Browser-based rendering
 │   ├── browser_manager.py
 │   └── helpers/
+│       ├── anti_blocking.py   # UA/viewport rotation, captcha detection
 │       ├── cookie_handler.py
 │       ├── domain_processor.py
 │       ├── logo_extractor.py
 │       ├── page_pool.py
 │       └── restart_manager.py
 └── utils/
+    ├── csv_writer.py
     ├── progress.py
     ├── validators.py
     └── worker.py
@@ -123,11 +136,15 @@ Key settings in `config.py`:
 
 | Setting                   | Default | Description                     |
 | ------------------------- | ------- | ------------------------------- |
-| `MAX_DOMAINS`             | 50      | Limit domains to process        |
+| `MAX_DOMAINS`             | 1000    | Limit domains to process        |
 | `DEFAULT_TIMEOUT`         | (2, 5)  | Connect/read timeout in seconds |
-| `PLAYWRIGHT_TIMEOUT`      | 10000   | Browser timeout in milliseconds |
 | `PLAYWRIGHT_TABS`         | 4       | Concurrent browser tabs         |
-| `RESTART_EVERY_N_DOMAINS` | 50      | Browser restart interval        |
+| `RESTART_EVERY_N_DOMAINS` | 50      | Context restart interval        |
+| `DOMAIN_TIMEOUT`          | 12000   | Hard per-domain timeout (ms)    |
+| `NAV_TIMEOUT`             | 8000    | Navigation timeout per URL (ms) |
+| `PAGE_MAX_USES`           | 25      | Page lifecycle limit            |
+| `REQUEST_DELAY_MIN`       | 500     | Min delay between requests (ms) |
+| `REQUEST_DELAY_MAX`       | 1500    | Max delay between requests (ms) |
 
 ---
 

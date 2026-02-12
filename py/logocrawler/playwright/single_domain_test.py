@@ -8,7 +8,7 @@ async def main():
     domain = sys.argv[1] if len(sys.argv) > 1 else "shopify.com"
 
     async with async_playwright() as p:
-        browser = await p.firefox.launch(headless=False, args=['--no-sandbox'])
+        browser = await p.firefox.launch(headless=True,)
         result = await process_domain_playwright(browser, domain)
         print(f"Domain: {result[0]}")
         print(f"Logo URL: {result[1] or 'Not found'}")

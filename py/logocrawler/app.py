@@ -1,14 +1,13 @@
-
-
 import sys
 import csv
 import time
 import asyncio
 import aiohttp
-from .config import HEADERS,MAX_DOMAINS
+from .config import HEADERS, MAX_DOMAINS
 
 
 from .utils.worker import get_optimal_workers, get_playwright_workers
+from .utils.csv_writer import IncrementalCSVWriter
 from .static.processor_async import process_domain_static
 from .utils.progress import print_progress
 
@@ -19,7 +18,7 @@ from .playwright.browser_manager import run_playwright_batch
 PROGRESS_UPDATE_INTERVAL = 1
 
 
-async def run_static_phase(domains, concurrency):
+async def run_static_phase(domains, concurrency, writer):
     """Phase 1: Static HTTP scraping with aiohttp."""
     total = len(domains)
     processed = 0
@@ -28,8 +27,6 @@ async def run_static_phase(domains, concurrency):
     failed_domains = []
     
     start_time = time.time()
-    
-    results = []
     
     sem = asyncio.Semaphore(concurrency)
     
@@ -65,7 +62,7 @@ async def run_static_phase(domains, concurrency):
             
             if logo_url:
                 found += 1
-                results.append((domain, logo_url))
+                await writer.write(domain, logo_url)
             else:
                 if needs_pw:
                     needs_render.append(domain)
@@ -82,15 +79,15 @@ async def run_static_phase(domains, concurrency):
     sys.stderr.write(f"\n[STATIC PHASE] Done in {elapsed:.1f}s | ")
     sys.stderr.write(f"found={found} needs_render={len(needs_render)} failed={len(failed_domains)}\n")
     
-    return results, needs_render, failed_domains
+    return found, needs_render, failed_domains
 
 
-async def run_playwright_phase(domains, concurrency):
+async def run_playwright_phase(domains, writer):
     """Phase 2: Playwright rendering for domains that need it."""
     if not domains:
-        return [], []
+        return 0, []
     
-    return await run_playwright_batch(domains, concurrency)
+    return await run_playwright_batch(domains, writer)
 
 
 
@@ -122,6 +119,10 @@ async def main():
     sys.stderr.write(f"\nDomains received: {original_total}\n")
     sys.stderr.write(f"Domains to crawl (after limit): {len(domains)}\n")
 
+    # Initialize incremental CSV writer
+    writer = IncrementalCSVWriter(sys.stdout, buffer_size=10)
+    writer.write_header()
+
     # ----------------------------
     # Phase 1: Static scraping
     # ----------------------------
@@ -129,7 +130,7 @@ async def main():
     sys.stderr.write(f"PHASE 1: Static HTTP Scraping ({static_workers} workers)\n")
     sys.stderr.write(f"{'='*60}\n")
 
-    static_results, needs_render, static_failed = await run_static_phase(domains, static_workers)
+    static_found, needs_render, static_failed = await run_static_phase(domains, static_workers, writer)
 
     # ----------------------------
     # Phase 2: Playwright rendering
@@ -139,23 +140,18 @@ async def main():
         sys.stderr.write(f"PHASE 2: Playwright Rendering ({playwright_workers} workers)\n")
         sys.stderr.write(f"{'='*60}\n")
 
-        playwright_results, playwright_failed = await run_playwright_phase(needs_render, playwright_workers)
+        playwright_found, playwright_failed = await run_playwright_phase(needs_render, writer)
     else:
-        playwright_results = []
+        playwright_found = 0
         playwright_failed = []
         sys.stderr.write("\n[SKIP] No domains need rendering - all found in static phase!\n")
 
-    # ----------------------------
-    # Combine results
-    # ----------------------------
-    all_results = static_results + playwright_results
-    all_failed = static_failed + playwright_failed
+    # Flush any remaining buffered results
+    await writer.close()
 
-    # Output successful results to stdout
-    writer = csv.writer(sys.stdout)
-    writer.writerow(["domain", "logo_url"])
-    for domain, logo in all_results:
-        writer.writerow([domain, logo])
+    # Combine failed domains
+    all_failed = static_failed + playwright_failed
+    total_found = static_found + playwright_found
 
     # Write failed domains to CSV file
     if all_failed:
@@ -173,10 +169,10 @@ async def main():
     sys.stderr.write("FINAL RESULTS\n")
     sys.stderr.write(f"{'='*60}\n")
     sys.stderr.write(f"Total crawled: {len(domains)}\n")
-    sys.stderr.write(f"Found (static): {len(static_results)}\n")
-    sys.stderr.write(f"Found (playwright): {len(playwright_results)}\n")
-    sys.stderr.write(f"Total found: {len(all_results)}\n")
-    sys.stderr.write(f"Failed: {len(domains) - len(all_results)}\n")
+    sys.stderr.write(f"Found (static): {static_found}\n")
+    sys.stderr.write(f"Found (playwright): {playwright_found}\n")
+    sys.stderr.write(f"Total found: {total_found}\n")
+    sys.stderr.write(f"Failed: {len(domains) - total_found}\n")
 
 
 if __name__ == "__main__":

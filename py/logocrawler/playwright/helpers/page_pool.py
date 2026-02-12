@@ -2,12 +2,15 @@
 
 Manages a fixed pool of browser pages (tabs) for concurrent scraping.
 Pages are reused across domains to avoid creation/destruction overhead.
+Includes page lifecycle management - pages are recycled after N uses.
 """
 
 import asyncio
 import sys
-from typing import Optional
+from typing import Optional, Dict
 from playwright.async_api import Page, BrowserContext
+
+from ...config import PAGE_MAX_USES
 
 
 class PagePool:
@@ -35,6 +38,7 @@ class PagePool:
         self.size = size
         self._available: asyncio.Queue[Page] = asyncio.Queue()
         self._all_pages: list[Page] = []
+        self._page_usage: Dict[Page, int] = {}  # Track usage per page
         self._initialized = False
     
     async def __aenter__(self) -> "PagePool":
@@ -55,6 +59,7 @@ class PagePool:
             try:
                 page = await self.context.new_page()
                 self._all_pages.append(page)
+                self._page_usage[page] = 0  # Initialize usage counter
                 await self._available.put(page)
             except Exception as e:
                 sys.stderr.write(f"[POOL] Failed to create page {i}: {e}\n")
@@ -92,7 +97,7 @@ class PagePool:
         Release a page back to the pool.
         
         Clears page state before returning it to the pool.
-        If page is crashed, creates a replacement.
+        If page is crashed or exceeded usage limit, creates a replacement.
         
         Args:
             page: The page to release
@@ -102,6 +107,16 @@ class PagePool:
             if page.is_closed():
                 # Page crashed - create replacement
                 sys.stderr.write("[POOL] Page crashed, creating replacement\n")
+                await self._replace_page(page)
+                return
+            
+            # Increment usage counter
+            usage = self._page_usage.get(page, 0) + 1
+            self._page_usage[page] = usage
+            
+            # Check if page exceeded lifecycle limit
+            if usage >= PAGE_MAX_USES:
+                sys.stderr.write(f"[POOL] Page recycled after {usage} uses\n")
                 await self._replace_page(page)
                 return
             
@@ -119,14 +134,22 @@ class PagePool:
         """
         Clear page state between domains.
         
+        Performs:
+        - Navigate to about:blank
+        - Clear localStorage and sessionStorage
+        
         Args:
             page: Page to clear
         """
         try:
             # Navigate to blank page to clear state
-            await page.goto("about:blank", timeout=5000)
+            await page.goto("about:blank", wait_until="domcontentloaded", timeout=3000)
+            
+            # Clear web storage (localStorage/sessionStorage)
+            await page.evaluate("() => { try { localStorage.clear(); sessionStorage.clear(); } catch(e) {} }")
+            
         except Exception:
-            # If goto fails, page might be in bad state
+            # If cleanup fails, page might be in bad state
             pass
     
     async def _replace_page(self, old_page: Page) -> None:
@@ -141,6 +164,10 @@ class PagePool:
             if old_page in self._all_pages:
                 self._all_pages.remove(old_page)
             
+            # Remove from usage tracking
+            if old_page in self._page_usage:
+                del self._page_usage[old_page]
+            
             # Close if not already closed
             if not old_page.is_closed():
                 await old_page.close()
@@ -148,10 +175,12 @@ class PagePool:
             # Create replacement
             new_page = await self.context.new_page()
             self._all_pages.append(new_page)
+            self._page_usage[new_page] = 0  # Initialize usage counter
             await self._available.put(new_page)
             
-        except Exception as e:
-            sys.stderr.write(f"[POOL] Failed to replace page: {e}\n")
+        except Exception:
+            # Context may be closed during restart - this is expected
+            pass
     
     async def close(self) -> None:
         """Close all pages in the pool."""
@@ -163,7 +192,37 @@ class PagePool:
                 pass
         
         self._all_pages.clear()
+        self._page_usage.clear()
+        
+        # Drain the queue
+        while not self._available.empty():
+            try:
+                self._available.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        
         self._initialized = False
+    
+    async def rebuild(self, new_context: BrowserContext) -> None:
+        """
+        Rebuild the pool with a new context.
+        
+        Closes all existing pages and creates new ones in the new context.
+        Used when restarting the context for memory efficiency.
+        
+        Args:
+            new_context: The new browser context to use
+        """
+        # Close all existing pages
+        await self.close()
+        
+        # Update context reference
+        self.context = new_context
+        
+        # Reinitialize with new pages
+        await self._initialize()
+        
+        sys.stderr.write(f"[POOL] Rebuilt with new context ({len(self._all_pages)} pages)\n")
     
     @property
     def available_count(self) -> int:

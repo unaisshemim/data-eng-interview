@@ -5,44 +5,46 @@ Orchestrates:
 - Browser context lifecycle
 - Page pool management
 - Restart logic for memory efficiency
+- Anti-blocking: rate limiting, UA/viewport rotation
 """
 
 import sys
 import time
 import asyncio
 from typing import List, Tuple
-from playwright.async_api import async_playwright, Browser, BrowserContext
+from playwright.async_api import async_playwright
 
-from ..config import PLAYWRIGHT_TABS, PLAYWRIGHT_TIMEOUT
+from ..config import PLAYWRIGHT_TABS, DOMAIN_TIMEOUT
 from ..utils.progress import print_progress
 from .helpers.page_pool import PagePool
 from .helpers.domain_processor import process_domain
 from .helpers.restart_manager import RestartManager
+from .helpers.anti_blocking import (
+    get_random_user_agent,
+    get_random_viewport,
+    random_delay,
+)
 
 
 PROGRESS_UPDATE_INTERVAL = 1
 
 
+def _create_context_options() -> dict:
+    """Generate randomized context options for anti-blocking."""
+    return {
+        "viewport": get_random_viewport(),
+        "user_agent": get_random_user_agent(),
+    }
+
+
 async def run_playwright_batch(
     domains: List[str],
-    concurrency: int
-) -> Tuple[List[Tuple[str, str]], List[str]]:
-    """
-    Process domains using Playwright with Firefox.
-    
-    Args:
-        domains: List of domain strings to process
-        concurrency: Number of parallel workers (used for worker count, not tabs)
-        
-    Returns:
-        Tuple of (results, failed_domains):
-        - results: List of (domain, logo_url) tuples
-        - failed_domains: List of domain strings that failed
-    """
+    writer,
+) -> Tuple[int, List[str]]:
+   
     if not domains:
-        return [], []
+        return 0, []
     
-    results: List[Tuple[str, str]] = []
     failed_domains: List[str] = []
     
     total = len(domains)
@@ -54,20 +56,19 @@ async def run_playwright_batch(
     # Use configured tab count
     tab_count = PLAYWRIGHT_TABS
     
+    # Hard per-domain timeout in seconds
+    domain_timeout_sec = DOMAIN_TIMEOUT / 1000
+    
     async with async_playwright() as p:
-        # Launch Firefox browser
+        # Launch Firefox browser (kept alive throughout batch)
         browser = await p.firefox.launch(
-            headless=True,
-            args=["--no-sandbox"]
+            headless=False,
         )
         
         sys.stderr.write(f"[PW] Firefox launched, {tab_count} tabs\n")
         
-        # Create context and page pool
-        context = await browser.new_context(
-            viewport={"width": 1280, "height": 720},
-            user_agent="Mozilla/5.0 (compatible; LogoCrawler/2.0)"
-        )
+        # Create context with randomized UA/viewport
+        context = await browser.new_context(**_create_context_options())
         
         restart_manager = RestartManager()
         
@@ -76,12 +77,22 @@ async def run_playwright_batch(
             sem = asyncio.Semaphore(tab_count)
             
             async def process_one(domain: str) -> Tuple[str, str, bool]:
-                """Process single domain, returns (domain, logo, success)."""
+                """Process single domain with rate limiting and hard timeout."""
+                # Rate limiting: random delay before starting
+                await random_delay()
+                
                 async with sem:
                     page = await pool.acquire()
                     try:
-                        result = await process_domain(page, domain)
+                        # Hard per-domain timeout wrapper
+                        result = await asyncio.wait_for(
+                            process_domain(page, domain),
+                            timeout=domain_timeout_sec
+                        )
                         return (result[0], result[1], bool(result[1]))
+                    except asyncio.TimeoutError:
+                        sys.stderr.write(f"[PW] Hard timeout ({DOMAIN_TIMEOUT}ms): {domain}\n")
+                        return (domain, "", False)
                     except Exception as e:
                         sys.stderr.write(f"[PW] Error processing {domain}: {e}\n")
                         return (domain, "", False)
@@ -99,7 +110,7 @@ async def run_playwright_batch(
                 
                 if success and logo:
                     found += 1
-                    results.append((domain, logo))
+                    await writer.write(domain, logo)
                 else:
                     failed_domains.append(domain)
                 
@@ -110,21 +121,22 @@ async def run_playwright_batch(
                         start_time, tab_count
                     )
                 
-                # Check if restart needed
+                # Check if context restart needed (browser stays alive)
                 if restart_manager.should_restart() and processed < total:
-                    # Close current pool and context
-                    await pool.close()
-                    await context.close()
+                    # Close old context
+                    old_context = context
                     
-                    # Create new context and reinitialize pool
-                    context = await browser.new_context(
-                        viewport={"width": 1280, "height": 720},
-                        user_agent="Mozilla/5.0 (compatible; LogoCrawler/2.0)"
-                    )
-                    pool.context = context
-                    await pool._initialize()
+                    # Create new context with randomized options
+                    context = await browser.new_context(**_create_context_options())
+                    
+                    # Rebuild pool with new context
+                    await pool.rebuild(context)
+                    
+                    # Now safe to close old context
+                    await old_context.close()
                     
                     restart_manager.record_restart()
+                    sys.stderr.write(f"[PW] Context restarted (browser kept alive)\n")
         
         # Cleanup
         await context.close()
@@ -136,4 +148,4 @@ async def run_playwright_batch(
         f"found={found} failed={len(failed_domains)}\n"
     )
     
-    return results, failed_domains
+    return found, failed_domains
